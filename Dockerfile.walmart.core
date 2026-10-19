@@ -1,0 +1,54 @@
+# 复用/复制出处见 docs/walmart/README.md 的来源对照表。
+# 编译基础和运行基础均使用已导入企业 Harbor 的镜像。
+ARG BASE_IMAGE
+ARG BUILD_TOOLS_IMAGE
+FROM ${BUILD_TOOLS_IMAGE} AS build
+USER root
+WORKDIR /tmp/toolchain
+# 离线安装 Go 1.26，覆盖旧 build-tools 自带的 Go。
+COPY docs/walmart/offline/go1.26.0.linux-amd64.tar.gz docs/walmart/offline/go.SHA256SUMS ./
+RUN sha256sum --strict -c go.SHA256SUMS \
+    && test "$(uname -m)" = x86_64 \
+    && mkdir -p /opt && tar -xzf go1.26.0.linux-amd64.tar.gz -C /opt \
+    && rm go1.26.0.linux-amd64.tar.gz
+ENV GOROOT=/opt/go PATH=/opt/go/bin:${PATH} GOPATH=/go GOENV=off GOTOOLCHAIN=local
+ARG GOPROXY=http://cno-repository.cn.wal-mart.com/repository/GoproxCn/
+ARG SOURCE_REVISION
+ARG BUILD_VERSION=2.2.5-walmart
+ENV GOPROXY=${GOPROXY} GOSUMDB=off GOWORK=off GONOPROXY=none GOVCS=*:off \
+    GOMAXPROCS=4 GOFLAGS="-mod=readonly -buildvcs=false -p=4" GOOS=linux GOARCH=amd64
+WORKDIR /src
+COPY . .
+# 仅准备 external/ 和元数据，编译命令由下方官方 Make 目标执行。
+RUN bash docs/walmart/prepare-source.sh
+
+# 官方单二进制规则：跳过 prebuild 的联网初始化，不在容器内启动 Docker。
+# VERSION_PACKAGE 覆盖当前源码中不存在的 lversion 包名，详见指引。
+RUN make BUILD_WITH_CONTAINER=0 BUILD_ALL=false TARGET_ARCH=amd64 TARGET_OS=linux \
+      TARGET_OUT=/out TARGET_OUT_LINUX=/out TAG="$BUILD_VERSION" GIT_COMMIT="$SOURCE_REVISION" \
+      VERSION_PACKAGE=github.com/alibaba/higress/v2/pkg/cmd/version \
+      BUILDINFO=/out/controller.buildinfo /out/higress \
+    && make -C external/istio BUILD_WITH_CONTAINER=0 BUILD_ALL=false \
+      TARGET_ARCH=amd64 TARGET_OS=linux TARGET_OUT=/out TARGET_OUT_LINUX=/out \
+      REPO_ROOT=/src/external/istio TAG="$BUILD_VERSION" VERSION="$BUILD_VERSION" \
+      BUILDINFO=/out/istio.buildinfo /out/pilot-discovery
+
+# 控制面有两个容器，因此分别导出 higress-core、discovery 镜像。
+FROM ${BASE_IMAGE} AS base
+USER root
+WORKDIR /
+RUN test "$(dpkg --print-architecture)" = amd64 && test -x /bin/bash && command -v nc
+
+FROM base AS higress-core
+COPY --from=build /out/higress /usr/local/bin/higress
+COPY --from=build /out/build-info.txt /etc/higress-source-build.txt
+USER 1337:1337
+ENTRYPOINT ["/usr/local/bin/higress"]
+
+FROM base AS discovery
+COPY --from=build /out/pilot-discovery /usr/local/bin/pilot-discovery
+COPY --from=build /out/build-info.txt /etc/higress-source-build.txt
+COPY --from=build /src/external/istio/tools/packaging/common/higress-pilot-start.sh /usr/local/bin/higress-pilot-start.sh
+RUN chmod 0755 /usr/local/bin/higress-pilot-start.sh
+USER 1337:1337
+ENTRYPOINT ["/usr/local/bin/higress-pilot-start.sh"]

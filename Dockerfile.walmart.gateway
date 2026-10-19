@@ -1,0 +1,94 @@
+# 运行布局复制自 istio/istio/pilot/docker/Dockerfile.proxyv2；差异见 docs/walmart/README.md。
+# 编译基础和运行基础均使用已导入企业 Harbor 的镜像。
+ARG BASE_IMAGE
+ARG BUILD_TOOLS_IMAGE
+ARG FILTER_BUILD_IMAGE
+FROM ${BUILD_TOOLS_IMAGE} AS build
+USER root
+WORKDIR /tmp/toolchain
+# 离线安装 Go 1.26，覆盖旧 build-tools 自带的 Go。
+COPY docs/walmart/offline/go1.26.0.linux-amd64.tar.gz docs/walmart/offline/go.SHA256SUMS ./
+RUN sha256sum --strict -c go.SHA256SUMS \
+    && test "$(uname -m)" = x86_64 \
+    && mkdir -p /opt && tar -xzf go1.26.0.linux-amd64.tar.gz -C /opt \
+    && rm go1.26.0.linux-amd64.tar.gz
+ENV GOROOT=/opt/go PATH=/opt/go/bin:${PATH} GOPATH=/go GOENV=off GOTOOLCHAIN=local
+ARG GOPROXY=http://cno-repository.cn.wal-mart.com/repository/GoproxCn/
+ARG SOURCE_REVISION
+ARG BUILD_VERSION=2.2.5-walmart
+ENV GOPROXY=${GOPROXY} GOSUMDB=off GOWORK=off GONOPROXY=none GOVCS=*:off \
+    GOMAXPROCS=4 GOFLAGS="-mod=readonly -buildvcs=false -p=4" GOOS=linux GOARCH=amd64
+WORKDIR /src
+COPY . .
+# 仅准备 external/ 和元数据，编译命令由下方官方 Make 目标执行。
+RUN bash docs/walmart/prepare-source.sh
+
+# 使用官方 pilot-agent 单二进制目标，自动沿用官方编译标签。
+RUN make -C external/istio BUILD_WITH_CONTAINER=0 BUILD_ALL=false \
+      TARGET_ARCH=amd64 TARGET_OS=linux TARGET_OUT=/out TARGET_OUT_LINUX=/out \
+      REPO_ROOT=/src/external/istio TAG="$BUILD_VERSION" VERSION="$BUILD_VERSION" \
+      BUILDINFO=/out/istio.buildinfo /out/pilot-agent
+# Go filter 沿用官方独立的 Go 1.23 / Debian bullseye 编译环境。
+# 基础镜像的准备见 Dockerfile.walmart.filter-builder，企业构建时无需 apt。
+FROM ${FILTER_BUILD_IMAGE} AS filter
+USER root
+ARG GOPROXY=http://cno-repository.cn.wal-mart.com/repository/GoproxCn/
+ENV GOPROXY=${GOPROXY} GOSUMDB=off GOTOOLCHAIN=local GOWORK=off GOENV=off \
+    GONOPROXY=none GOVCS=*:off GOFLAGS="-mod=readonly -buildvcs=false -p=4" GOMAXPROCS=4
+WORKDIR /src/plugins/golang-filter
+COPY plugins/golang-filter/ ./
+COPY docs/walmart/golang-filter.mk /tmp/golang-filter.mk
+RUN make -f Makefile -f /tmp/golang-filter.mk walmart-local-build \
+      GOARCH=amd64 GOPROXY="$GOPROXY" OUTPUT=/out/golang-filter.so
+
+# 单独处理离线依赖，避免源码变化触发重复解包。
+FROM ${BUILD_TOOLS_IMAGE} AS assets
+USER root
+WORKDIR /assets
+COPY docs/walmart/offline/envoy-symbol-amd64.tar.gz docs/walmart/offline/supercronic-linux-amd64 docs/walmart/offline/gateway.SHA256SUMS ./
+COPY docs/walmart/offline/runtime-debs/ ./runtime-debs/
+RUN set -eu; \
+    for f in envoy-symbol-amd64.tar.gz supercronic-linux-amd64 runtime-debs/*.deb; do \
+      test -f "$f"; \
+      awk -v name="$f" '$2 == name {print}' gateway.SHA256SUMS > /tmp/asset.sha256; \
+      sha256sum --strict -c /tmp/asset.sha256; \
+    done; \
+    mkdir -p /tmp/envoy-extract /out; \
+    tar -xzf envoy-symbol-amd64.tar.gz -C /tmp/envoy-extract; \
+    find /tmp/envoy-extract -type f -name envoy > /tmp/envoy-paths; \
+    test "$(wc -l < /tmp/envoy-paths)" -eq 1; \
+    cp "$(cat /tmp/envoy-paths)" /out/envoy; \
+    cp supercronic-linux-amd64 /out/supercronic; \
+    chmod 0755 /out/envoy /out/supercronic
+
+# 运行镜像只保留二进制和系统依赖，不包含 Go/GCC 编译环境。
+FROM ${BASE_IMAGE} AS higress-gateway
+USER root
+WORKDIR /
+# 保留官方代理版本元信息入口；实际文件摘要另保存在镜像内。
+ARG proxy_version
+ENV ISTIO_META_ISTIO_PROXY_SHA=${proxy_version}
+COPY --from=assets /assets/runtime-debs/ /tmp/runtime-debs/
+# 直接离线安装完整依赖，避免旧 apt 的 --no-download 本地包路径错误。
+RUN test "$(dpkg --print-architecture)" = amd64 \
+    && dpkg -i /tmp/runtime-debs/*.deb \
+    && rm -rf /tmp/runtime-debs \
+    && mkdir -p /var/lib/istio/envoy /var/lib/logrotate /var/log/proxy
+COPY --from=assets /out/envoy /usr/local/bin/envoy
+COPY --from=assets /out/supercronic /usr/local/bin/supercronic
+COPY --from=assets /assets/gateway.SHA256SUMS /etc/higress-offline-assets.sha256
+COPY --from=build /out/pilot-agent /usr/local/bin/pilot-agent
+COPY --from=filter /out/golang-filter.so /var/lib/istio/envoy/golang-filter.so
+COPY --from=build /out/build-info.txt /etc/higress-source-build.txt
+COPY --from=build /src/external/istio/tools/packaging/common/higress_envoy_bootstrap.json /var/lib/istio/envoy/envoy_bootstrap_tmpl.json
+COPY --from=build /src/external/istio/tools/packaging/common/higress_envoy_bootstrap_lite.json /var/lib/istio/envoy/envoy_bootstrap_lite_tmpl.json
+COPY --from=build /src/external/istio/tools/packaging/common/higress-proxy-start.sh /usr/local/bin/higress-proxy-start.sh
+COPY --from=build /src/external/istio/tools/packaging/common/higress-proxy-container-init.sh /usr/local/bin/higress-proxy-container-init.sh
+RUN chmod 0755 /usr/local/bin/higress-proxy-*.sh \
+    && bash -e /usr/local/bin/higress-proxy-container-init.sh \
+    && /usr/local/bin/envoy --version && /usr/local/bin/pilot-agent version \
+    && /usr/local/bin/supercronic -test /var/lib/istio/cron.txt \
+    && ldd /var/lib/istio/envoy/golang-filter.so > /tmp/filter-ldd.txt 2>&1 \
+    && cat /tmp/filter-ldd.txt && ! grep -q 'not found' /tmp/filter-ldd.txt
+# 保留官方 Gateway 默认用户行为，Pod 的 securityContext 仍由部署配置控制。
+ENTRYPOINT ["/usr/local/bin/higress-proxy-start.sh"]

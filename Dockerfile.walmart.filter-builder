@@ -1,0 +1,9 @@
+# 只在有外网的中转机构建一次，再导入 Harbor。
+# 复制出处：plugins/golang-filter/Dockerfile 的 golang-base 和 amd64 工具安装分支。
+ARG GO_IMAGE=golang:1.23-bullseye
+FROM ${GO_IMAGE}
+USER root
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu make \
+    && rm -rf /var/lib/apt/lists/* \
+    && go version && command -v x86_64-linux-gnu-gcc && command -v x86_64-linux-gnu-as

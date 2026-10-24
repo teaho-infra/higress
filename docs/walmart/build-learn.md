@@ -84,20 +84,128 @@ higress-console/
   └─ --target discovery    → discovery:2.2.5-walmart（ENTRYPOINT higress-pilot-start.sh）
 ```
 
-### 3.3 gateway（三段编译 + 离线组装）
+### 3.3 gateway（重点精读：为什么分三步编译 + 逐行解读）
+
+Dockerfile.walmart.gateway 一共 4 个阶段：**两个编译阶段 + 一个解包校验阶段 + 一个组装阶段**。
+
+先认识最终镜像里的四个角色：
+
+- envoy：真正转发流量的引擎（C++ 写的），官方预编译直接用，我们不重编。
+- pilot-agent：envoy 的管理进程，负责拉起、监控、热更新 envoy。
+- golang-filter.so：Go 写的 Envoy 插件，编译成动态库（.so），envoy 运行时加载。
+- supercronic / logrotate / cron：容器内定时任务和日志轮转工具。
+
+**为什么拆成三个阶段？（核心原因：三种活要用互不兼容的工具链）**
+
+| 阶段 | 产物 | 工具链 | 为什么单独拆 |
+| --- | --- | --- | --- |
+| build | pilot-agent | Go 1.26（离线装进 build-tools） | Istio/higress 模块要求 Go 1.26；pilot-agent 是纯 Go 程序，无 C 依赖 |
+| filter | golang-filter.so | Go 1.23 + amd64 GCC | .so 是 CGO 动态库，必须过 C 编译器；实测与 Go 1.26 共用工具链会触发 Go/GCC 编译器内部错误（见 verification.md），官方 golang-filter Dockerfile 也用独立 Go 1.23 环境，照搬即可 |
+| assets | envoy、supercronic、deb | 无编译 | envoy 用官方预编译不重编；离线件与源码无关，独立成层后改源码重建时不必重新校验解包（Docker 层缓存提速） |
+| higress-gateway | 最终镜像 | 无编译 | 只拼装二进制和系统依赖，不带任何编译器，镜像小而干净 |
+
+一句话总结：**Go 1.26 纯 Go、Go 1.23+GCC 编 CGO、零编译只解包，三件事工具链互斥，分开编译既避免冲突又吃到构建缓存，最后在干净基础镜像上拼装。**
+
+总览：
 
 ```text
-[build]  build-tools + 离线 Go 1.26 → make -C external/istio /out/pilot-agent
-[filter] filter-builder 镜像（Go 1.23/bullseye，中转机预制）
-  └─ make -f Makefile -f golang-filter.mk walmart-local-build → golang-filter.so
-[assets] build-tools：校验 sha256 → 解包 envoy、supercronic、runtime-debs
-            │ 三阶段产物 COPY
-            ▼
-[运行阶段] higress-base
-  ├─ dpkg -i runtime-debs/*.deb          # 离线装 logrotate/cron
-  ├─ COPY envoy / pilot-agent / golang-filter.so / bootstrap 模板 / 启动脚本
-  ├─ 自检：envoy --version、pilot-agent version、supercronic -test、ldd 无 not found
-  └─ ENTRYPOINT higress-proxy-start.sh
+[阶段1 build]  Go 1.26 ──────> pilot-agent ─────┐
+[阶段2 filter] Go 1.23+GCC ──> golang-filter.so ─┼─> [阶段4 组装] higress-base + 自检 → 运行镜像
+[阶段3 assets] 校验解包 ─────> envoy/supercronic/deb ─┘
+```
+
+**Dockerfile.walmart.gateway 逐行解读**（长行用 … 缩写，完整以源文件为准）
+
+阶段 1 build——编 pilot-agent：
+
+```dockerfile
+ARG BASE_IMAGE / BUILD_TOOLS_IMAGE / FILTER_BUILD_IMAGE  # 三个镜像变量，构建时由 make 传入
+FROM ${BUILD_TOOLS_IMAGE} AS build       # 用企业 build-tools 当编译环境，本阶段命名 build
+WORKDIR /tmp/toolchain
+COPY offline/go1.26.0.linux-amd64.tar.gz offline/go.SHA256SUMS ./   # 拷入离线 Go 和校验清单
+RUN sha256sum --strict -c go.SHA256SUMS  # 校验摘要，损坏/被改立即失败
+  && test "$(uname -m)" = x86_64 && tar -xzf … -C /opt  # 确认 amd64 架构，解压到 /opt/go
+ENV GOROOT=/opt/go PATH=/opt/go/bin:${PATH} GOTOOLCHAIN=local  # 用刚装的 Go；禁止 go 自动联网换版本
+ARG GOPROXY / SOURCE_REVISION / BUILD_VERSION  # 公司 Go 代理、源码提交号、版本号，均由 make 传入
+ENV GOFLAGS="-mod=readonly -buildvcs=false -p=4" GOOS=linux GOARCH=amd64
+                    # -mod=readonly 锁死 go.sum 不许改；构建上下文无 .git 故禁读 VCS；限 4 并行；目标平台 amd64
+WORKDIR /src
+COPY . .                 # 整个源码进容器
+RUN bash docs/walmart/prepare-source.sh  # 把子模块拼成 external/，写 build-info/buildinfo 版本元数据
+RUN make -C external/istio BUILD_WITH_CONTAINER=0 BUILD_ALL=false \
+      TARGET_ARCH=amd64 TARGET_OS=linux TARGET_OUT=/out TAG=… VERSION=… /out/pilot-agent
+                    # 调官方 Istio Make 目标：BUILD_WITH_CONTAINER=0 在当前容器直接编（不再嵌套 Docker）；
+                    # BUILD_ALL=false 只编 pilot-agent 一个；TARGET_OUT=/out 指定产物目录；TAG/VERSION 注入版本信息
+```
+
+阶段 2 filter——编 golang-filter.so：
+
+```dockerfile
+FROM ${FILTER_BUILD_IMAGE} AS filter     # 关键：换基础镜像！Go 1.23/bullseye + amd64 GCC（中转机预制）
+ENV GOPROXY=… GOFLAGS="-mod=readonly …"  # 与阶段 1 一样锁代理、锁依赖
+WORKDIR /src/plugins/golang-filter
+COPY plugins/golang-filter/ ./           # 只拷 filter 源码，不动其他文件（层缓存更稳）
+COPY docs/walmart/golang-filter.mk /tmp/golang-filter.mk  # 附加编译目标，不修改官方 Makefile
+RUN make -f Makefile -f /tmp/golang-filter.mk walmart-local-build \
+      GOARCH=amd64 GOPROXY="$GOPROXY" OUTPUT=/out/golang-filter.so
+                    # 双 -f：官方规则 + 我们的附加目标，选 walmart-local-build 这个新入口
+```
+
+golang-filter.mk 里 walmart-local-build 的逐行解读（真正干活的 6 行）：
+
+```makefile
+test "$(GOARCH)" = amd64   # 只支持 amd64，其他架构直接报错
+mkdir -p $(dir $(OUTPUT))  # 建输出目录 /out
+CGO_ENABLED=1              # 打开 CGO：.so 要经过 C 编译器桥接
+GOOS=linux GOARCH=amd64    # 目标平台 linux/amd64
+CC=x86_64-linux-gnu-gcc AS=x86_64-linux-gnu-as  # 指定 amd64 交叉编译器和汇编器
+go build -o $(OUTPUT) -buildmode=c-shared .     # -buildmode=c-shared：编译成可被 envoy 动态加载的 .so
+```
+
+阶段 3 assets——校验解包离线件（不编译）：
+
+```dockerfile
+FROM ${BUILD_TOOLS_IMAGE} AS assets      # 只借现成镜像当解包工具，不装任何东西
+COPY offline/envoy-symbol-amd64.tar.gz offline/supercronic-linux-amd64 offline/gateway.SHA256SUMS ./
+COPY offline/runtime-debs/ ./runtime-debs/
+RUN for f in envoy… supercronic… runtime-debs/*.deb; do \
+      awk 从 gateway.SHA256SUMS 取该文件对应行 > /tmp/asset.sha256; \
+      sha256sum --strict -c /tmp/asset.sha256; done   # 逐文件校验摘要，缺/多/内容不符都报错
+    tar -xzf envoy…tar.gz; find … -name envoy; test 恰好 1 个   # 解包并确认只有一个 envoy 二进制（防呆）
+    cp 到 /out/envoy /out/supercronic; chmod 0755
+```
+
+阶段 4 higress-gateway——组装运行镜像：
+
+```dockerfile
+FROM ${BASE_IMAGE} AS higress-gateway    # 换回运行基础镜像 higress-base，此时已无编译器
+ENV ISTIO_META_ISTIO_PROXY_SHA=${proxy_version}  # 沿用官方代理版本元数据入口
+COPY --from=assets runtime-debs/ /tmp/runtime-debs/
+RUN dpkg -i /tmp/runtime-debs/*.deb      # 离线安装 logrotate/cron，不联网 apt
+  && mkdir -p /var/lib/istio/envoy /var/lib/logrotate /var/log/proxy  # 官方要求的运行目录
+COPY --from=assets /out/envoy /usr/local/bin/envoy            # 数据面引擎（官方预编译）
+COPY --from=assets /out/supercronic /usr/local/bin/supercronic  # 定时任务工具
+COPY --from=assets gateway.SHA256SUMS /etc/higress-offline-assets.sha256  # 离线件清单留档镜像内
+COPY --from=build /out/pilot-agent /usr/local/bin/pilot-agent   # 阶段 1 产物
+COPY --from=filter /out/golang-filter.so /var/lib/istio/envoy/  # 阶段 2 产物，envoy 的加载路径
+COPY --from=build /out/build-info.txt /etc/higress-source-build.txt  # 源码提交号/版本留档
+COPY --from=build …envoy_bootstrap.json / …bootstrap_lite.json  # 官方 bootstrap 模板（生成 envoy 启动配置用）
+COPY --from=build …higress-proxy-start.sh / …proxy-container-init.sh  # 官方启动/初始化脚本，直接 COPY 不重写
+RUN chmod 0755 脚本 && bash container-init.sh \
+    && envoy --version && pilot-agent version       # 构建期自检：脚本可执行、两个核心组件能跑
+    && supercronic -test /var/lib/istio/cron.txt    # 校验 crontab 文件合法
+    && ldd golang-filter.so 无 'not found'          # 检查 .so 动态库依赖齐全，否则构建失败
+ENTRYPOINT ["/usr/local/bin/higress-proxy-start.sh"]  # 容器启动即运行网关
+```
+
+构建命令（docs/walmart/Makefile 的 gateway 目标）逐行解读：
+
+```makefile
+gateway: gateway-inputs  # 先跑前置检查：FILTER_BUILD_IMAGE 变量非空、offline 下 envoy/supercronic/清单/deb 齐全
+	$(DOCKER) build $(BUILD_ARGS) \        # BUILD_ARGS = --platform linux/amd64 + BASE/BUILD_TOOLS/GOPROXY/SOURCE_REVISION/BUILD_VERSION 五个 --build-arg
+	  --build-arg "FILTER_BUILD_IMAGE=$(FILTER_BUILD_IMAGE)" \  # gateway 独有的第四个镜像变量
+	  -f Dockerfile.walmart.gateway --target higress-gateway \  # 指定 Dockerfile 与最终阶段
+	  -t "$(HUB)/higress-gateway:$(TAG)" .  # 打上最终镜像名，如 harbor.qa.wal-mart.cn/nonprod-ai-gateway/higress-gateway:2.2.5-walmart
 ```
 
 ### 3.4 构建语句解读
@@ -126,7 +234,6 @@ docker build --platform linux/amd64 \
 - `BUILD_WITH_CONTAINER=0`：在容器内直调官方 Make 目标，避免嵌套 Docker。
 - `VERSION_PACKAGE=…/pkg/cmd/version`：覆盖官方 Makefile 指向不存在包的默认值。
 - `-mod=readonly` + `GOPROXY` 不加 `,direct`：锁定 go.sum，缺模块直接报错不回源。
-- `walmart-local-build`：`CGO_ENABLED=1` + 指定交叉 GCC，`go build -buildmode=c-shared` 产出 `.so`。
 - `make check`：`docker run --network none <镜像> version`，断网验证二进制与 Envoy 可用。
 - `make push`：显式推送；images/check 永不推镜像。
 

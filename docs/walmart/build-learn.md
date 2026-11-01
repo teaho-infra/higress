@@ -271,3 +271,8 @@ higress-console:0.0.1                 控制台（jar 内嵌前端）
 ```
 
 部署替换集群镜像前，仍需在测试集群验证 xDS、路由与 Go filter 业务功能（构建检查不覆盖）。
+
+
+## 本地开发与断点调试
+
+构建完成后，按 [本地开发与全链路调试教程](local-development-debugging.md) 进行 Console、Core、Pilot 与 Gateway 联调。教程包含独立开发环境、断点、E2E 和恢复步骤。

@@ -1,0 +1,23 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-quota-walmart
+  namespace: higress-system
+spec:
+  defaultConfigDisable: true
+  matchRules:
+  - ingress: [walmart-quota-demo]
+    configDisable: false
+    config:
+      dimensions: [user, app]
+      admin_consumer: quota-admin
+      admin_path: /quota
+      redis_key_prefix: 'wmt_quota:'
+      redis:
+        service_name: redis.default.svc.cluster.local
+        service_port: 6379
+        timeout: 2000
+  phase: UNSPECIFIED_PHASE
+  priority: 750
+  # Publish the locally built plugin.wasm before applying this OCI example.
+  url: oci://YOUR_REGISTRY/ai-quota-walmart:1.0.0-alpha

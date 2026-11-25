@@ -31,7 +31,7 @@ func TestTierValidation(t *testing.T) {
 	if err := validateTiers(defaultTiers); err != nil {
 		t.Fatal(err)
 	}
-	for _, raw := range []string{`{}`, `{"L1":{"quota":1},"L2":{"quota":0},"L3":{"quota":2}}`, `{"L1":{"quota":1.5},"L2":{"quota":2},"L3":{"quota":3}}`} {
+	for _, raw := range []string{`{}`, `{"L1":{"quota":1},"L2":{"quota":0},"L3":{"quota":2}}`, `{"L1":{"quota":1.5},"L2":{"quota":2}}`} {
 		if validateTiers(raw) == nil {
 			t.Fatal(raw)
 		}
@@ -51,6 +51,13 @@ func TestPublicAdminBoundary(t *testing.T) {
 	}
 	if !publicAction("GET", "accounts") || !publicAction("POST", "assign") {
 		t.Fatal("public actions rejected")
+	}
+	if !publicAction("POST", "cycle") || !publicAction("POST", "reset") || publicAction("GET", "reset") {
+		t.Fatal("money cycle actions rejected")
+	}
+	if validateAdminFields("cycle", map[string]any{"days": 7, "period": "p", "ticket_id": "t"}) != nil ||
+		validateAdminFields("reset", map[string]any{"days": 7}) == nil {
+		t.Fatal("cycle action fields invalid")
 	}
 	if validateAdminFields("assign", map[string]any{"dimension": "user", "subject": "u", "tier": "L2", "period": "p", "ticket_id": "t", "app": "a"}) != nil {
 		t.Fatal("valid fields rejected")
@@ -79,7 +86,7 @@ func TestMissingModelRejected(t *testing.T) {
 	}
 }
 func TestNullModelsRejected(t *testing.T) {
-	if validateTiers(`{"L1":{"quota":1,"models":null},"L2":{"quota":2},"L3":{"quota":3}}`) == nil {
+	if validateTiers(`{"L1":{"quota":1,"models":null},"L2":{"quota":2}}`) == nil {
 		t.Fatal("null models")
 	}
 }

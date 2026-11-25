@@ -23,7 +23,7 @@ import (
 //go:embed ledger.lua
 var ledgerScript string
 
-const defaultTiers = `{"L1":{"quota":330000000,"models":[]},"L2":{"quota":1000000000,"models":[]},"L3":{"quota":2300000000,"models":[]}}`
+const defaultTiers = `{"L1":{"quota":500000000,"models":[]},"L2":{"quota":1500000000,"models":[]}}`
 
 func periodAt(t time.Time) (string, string, string) {
 	z := time.FixedZone("Asia/Shanghai", 8*3600)
@@ -115,7 +115,7 @@ func dimensionalHeaders(ctx wrapper.HttpContext, c QuotaConfig) types.Action {
 		ctx.SetContext("wmAdmin", a)
 		ctx.SetContext("consumer", consumer)
 		method, _ := proxywasm.GetHttpRequestHeader(":method")
-		if a == "prices" && c.BudgetPolicy != moneyPolicy {
+		if (a == "prices" || a == "cycle" || a == "reset") && c.BudgetPolicy != moneyPolicy {
 			return problem(405, "method_not_allowed", "Money policy required")
 		}
 		if !publicAction(method, a) {
@@ -262,7 +262,7 @@ func adminRun(c QuotaConfig, r map[string]any, operator string) types.Action {
 			r[k] = n
 		}
 	}
-	if a != "meta" && a != "audit" && a != "tiers" && a != "prices" {
+	if a != "meta" && a != "audit" && a != "tiers" && a != "prices" && a != "cycle" && a != "reset" {
 		d, _ := r["dimension"].(string)
 		if d != "user" && d != "app" && !(c.BudgetPolicy == moneyPolicy && d == "department") {
 			return problem(400, "invalid_dimension", "dimension must be user or app")
@@ -275,26 +275,26 @@ func adminRun(c QuotaConfig, r map[string]any, operator string) types.Action {
 		}
 	}
 	if c.BudgetPolicy == moneyPolicy {
-		if (a == "tier" || a == "delta" || a == "refresh") && r["dimension"] != "user" {
+		if (a == "delta" || a == "refresh") && r["dimension"] != "user" {
 			return problem(400, "invalid_dimension", "User required")
 		}
 		if a == "assign" && r["dimension"] == "app" {
 			return problem(400, "invalid_dimension", "App is usage only")
 		}
 	}
-	mutation := (a == "prices" && r["prices"] != nil) || a == "assign" || a == "tier" || a == "delta" || a == "refresh" || a == "tiers"
+	mutation := (a == "prices" && r["prices"] != nil) || a == "assign" || a == "delta" || a == "refresh" || a == "tiers" || a == "cycle" || a == "reset"
 	if mutation {
 		p, _, _ := periodAt(time.Now())
-		if r["period"] != p {
+		if c.BudgetPolicy != moneyPolicy && r["period"] != p {
 			return problem(409, "period_conflict", "Current period required")
 		}
 		ticket, _ := r["ticket_id"].(string)
 		if ticket == "" || len(ticket) > 128 {
 			return problem(400, "invalid_ticket", "ticket_id required, maximum 128 bytes")
 		}
-		if a == "assign" || a == "tier" {
+		if a == "assign" {
 			t, _ := r["tier"].(string)
-			if t != "L1" && t != "L2" && t != "L3" && !(c.BudgetPolicy == moneyPolicy && a == "assign" && r["dimension"] == "user" && t == "inherit") {
+			if t != "L1" && t != "L2" && !(c.BudgetPolicy == moneyPolicy && a == "assign" && r["dimension"] == "user" && t == "inherit") {
 				return problem(400, "invalid_tier", "Unknown tier")
 			}
 		}
@@ -304,6 +304,35 @@ func adminRun(c QuotaConfig, r map[string]any, operator string) types.Action {
 				return problem(400, "invalid_amount", "Integer outside safe range")
 			}
 			r["value"], _ = strconv.ParseInt(s, 10, 64)
+		}
+		if a == "cycle" {
+			days, err := strconv.Atoi(fmt.Sprint(r["days"]))
+			if err != nil || days < 1 || days > 365 {
+				return problem(400, "invalid_cycle", "days must be an integer from 1 to 365")
+			}
+			r["days"] = days
+		}
+		if a == "reset" {
+			startText, hasStart := r["start_date"].(string)
+			endText, hasEnd := r["end_date"].(string)
+			if hasStart != hasEnd || (hasStart && (startText == "" || endText == "")) {
+				return problem(400, "invalid_cycle", "start_date and end_date must be supplied together")
+			}
+			if hasStart {
+				zone := time.FixedZone("Asia/Shanghai", 8*3600)
+				start, startErr := time.ParseInLocation("2006-01-02", startText, zone)
+				end, endErr := time.ParseInLocation("2006-01-02", endText, zone)
+				if startErr != nil || endErr != nil || end.Before(start) || end.Sub(start) >= 365*24*time.Hour {
+					return problem(400, "invalid_cycle", "Reset date range must last 1 to 365 days")
+				}
+				endExclusive := end.AddDate(0, 0, 1)
+				now := time.Now()
+				if now.Before(start) || !now.Before(endExclusive) {
+					return problem(400, "invalid_cycle", "Reset date range must include today in Asia/Shanghai")
+				}
+				r["start_unix"] = start.Unix()
+				r["end_unix"] = endExclusive.Unix()
+			}
 		}
 		if a == "tiers" {
 			v := r["tiers"]
@@ -318,10 +347,10 @@ func adminRun(c QuotaConfig, r map[string]any, operator string) types.Action {
 				Quota  json.Number `json:"quota"`
 				Models []string    `json:"models"`
 			}
-			if json.Unmarshal(b, &tiers) != nil || len(tiers) != 3 {
-				return problem(400, "invalid_tiers", "Three tiers required")
+			if json.Unmarshal(b, &tiers) != nil || len(tiers) != 2 {
+				return problem(400, "invalid_tiers", "Two tiers required")
 			}
-			for _, k := range []string{"L1", "L2", "L3"} {
+			for _, k := range []string{"L1", "L2"} {
 				t, ok := tiers[k]
 				if !ok || !validAmount(string(t.Quota)) || strings.HasPrefix(string(t.Quota), "-") {
 					return problem(400, "invalid_tiers", "Invalid tier quota")
@@ -336,7 +365,7 @@ func adminRun(c QuotaConfig, r map[string]any, operator string) types.Action {
 			}
 		}
 		canonical := map[string]any{}
-		for _, k := range []string{"action", "period", "dimension", "subject", "app", "tier", "value", "tiers", "department", "prices"} {
+		for _, k := range []string{"action", "period", "dimension", "subject", "app", "tier", "value", "tiers", "department", "prices", "days", "start_date", "end_date"} {
 			if v, ok := r[k]; ok {
 				canonical[k] = v
 			}
@@ -422,7 +451,7 @@ func validateDimensions(d gjson.Result) error {
 	return nil
 }
 func validateTiers(raw string) error {
-	for _, k := range []string{"L1", "L2", "L3"} {
+	for _, k := range []string{"L1", "L2"} {
 		models := gjson.Get(raw, k+".models")
 		if models.Exists() && !models.IsArray() {
 			return fmt.Errorf("models must be an array when provided")
@@ -432,11 +461,11 @@ func validateTiers(raw string) error {
 		Quota  json.Number `json:"quota"`
 		Models []string    `json:"models"`
 	}
-	if json.Unmarshal([]byte(raw), &tiers) != nil || len(tiers) != 3 {
-		return fmt.Errorf("exactly three tiers required")
+	if json.Unmarshal([]byte(raw), &tiers) != nil || len(tiers) != 2 {
+		return fmt.Errorf("exactly two tiers required")
 	}
 	var previous int64
-	for _, k := range []string{"L1", "L2", "L3"} {
+	for _, k := range []string{"L1", "L2"} {
 		t, ok := tiers[k]
 		if !ok || !validAmount(string(t.Quota)) {
 			return fmt.Errorf("invalid tier quota")
@@ -459,7 +488,7 @@ func publicAction(method, action string) bool {
 	}
 	if method == "POST" {
 		switch action {
-		case "assign", "tier", "delta", "refresh", "tiers", "prices":
+		case "assign", "delta", "refresh", "tiers", "prices", "cycle", "reset":
 			return true
 		}
 	}
@@ -471,11 +500,12 @@ func validateAdminFields(action string, data map[string]any) error {
 		"meta": {}, "query": {"dimension", "subject"}, "usage": {"dimension", "subject"},
 		"accounts": {"dimension", "offset", "limit"}, "audit": {"offset", "limit"},
 		"assign":  {"dimension", "subject", "app", "department", "tier", "ticket_id", "period"},
-		"tier":    {"dimension", "subject", "tier", "ticket_id", "period"},
 		"delta":   {"dimension", "subject", "value", "ticket_id", "period"},
 		"refresh": {"dimension", "subject", "ticket_id", "period"},
 		"tiers":   {"tiers", "ticket_id", "period"},
 		"prices":  {"prices", "ticket_id", "period"},
+		"cycle":   {"days", "ticket_id", "period"},
+		"reset":   {"ticket_id", "period", "start_date", "end_date"},
 	}
 	list, ok := fields[action]
 	if !ok {
@@ -488,7 +518,7 @@ func validateAdminFields(action string, data map[string]any) error {
 		if !allowed[k] {
 			return fmt.Errorf("unknown or reserved field: %s", k)
 		}
-		if k == "app" || k == "department" || k == "dimension" || k == "subject" || k == "tier" || k == "period" || k == "ticket_id" {
+		if k == "app" || k == "department" || k == "dimension" || k == "subject" || k == "tier" || k == "period" || k == "ticket_id" || k == "start_date" || k == "end_date" {
 			a, ok := v.(string)
 			if !ok || len(a) > 256 {
 				return fmt.Errorf("app must be a string of at most 256 bytes")

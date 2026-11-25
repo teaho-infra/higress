@@ -15,12 +15,11 @@ redis:
   timeout: 2000
 enable_path_suffixes: [/v1/chat/completions, /v1/messages]
 tiers:
-  L1: {quota: 330000000, models: []}
-  L2: {quota: 1000000000, models: []}
-  L3: {quota: 2300000000, models: ['*']}
+  L1: {quota: 500000000, models: []}
+  L2: {quota: 1500000000, models: []}
 ```
 
-Also accepts the document's two dimension objects: user `name/user`, `enabled/true`, `subject_source/request_header`, `subject_key/x-codebuddy-user-id`; app `name/app`, `enabled/true`, `subject_source/consumer`. Both dimensions are required. Per-dimension Redis prefix fields are not used: the single configured namespace stores atomic multi-account ledgers. Fixed current implementation period: 14 days anchored 2026-01-05T00:00:00+08:00, ID start date, end exclusive. Other period/tier-strategy settings are not configurable in this version.
+Also accepts the document's two dimension objects: user `name/user`, `enabled/true`, `subject_source/request_header`, `subject_key/x-codebuddy-user-id`; app `name/app`, `enabled/true`, `subject_source/consumer`. Both dimensions are required. Per-dimension Redis prefix fields are not used: the single configured namespace stores atomic multi-account ledgers. The default period is 14 days anchored 2026-01-05T00:00:00+08:00; money budgets can change the period through the admin API described below.
 
 Run after KeyAuth. `x-mse-consumer` must be produced by KeyAuth; `x-codebuddy-user-id` must be overwritten by a trusted identity proxy. Public untrusted user headers are not authentication. The administrator is exactly the authenticated configured `quota-admin` consumer. Never expose its key to browsers.
 
@@ -37,7 +36,6 @@ POST accepts JSON or URL-encoded form:
 ```
 
 - `/assign`: persistent base assignment and immediate tier adjustment; preserves spending and addons. `app` is optional association for a user.
-- `/tier`: temporary current-period upgrade only; preserves spending/addons. Lower tier returns 409.
 - `/delta`: signed integer `value`, current-period entitlement adjustment; cannot produce negative limit.
 - `/refresh`: idempotent current-period initialization; never returns spent quota.
 - `/tiers`: `tiers` object in the same shape as configuration; changes future initialization only. Existing ledger entitlements remain unchanged. Later explicit tier changes use the new template, adjusting from the stored original base quota.
@@ -50,13 +48,13 @@ All mutations require current `period` and `ticket_id`. The same ticket and cano
 
 ## Atomicity and boundaries
 
-One Redis Lua operation initializes/checks both dimensions, settles both usage counters, or applies/audits/idempotently records an administrative change. Persistent assignments are separate from period ledgers. Each accepted completion carries its original period and payer, so late completion is charged there. A new period drops temporary tiers/addons and starts usage at zero. Redis TIME validates the period boundary within the atomic operation. Use a standalone Redis deployment: dynamically accessed keys are not Redis Cluster hash-slot compatible.
+One Redis Lua operation initializes/checks both dimensions, settles both usage counters, or applies/audits/idempotently records an administrative change. Persistent assignments are separate from period ledgers. Each accepted completion carries its original period and payer, so late completion is charged there. A new period drops temporary quota additions and starts usage at zero. Redis TIME validates the period boundary within the atomic operation. Use a standalone Redis deployment: dynamically accessed keys are not Redis Cluster hash-slot compatible.
 
 Charging is based on upstream usage after response, including streaming usage handled by upstream tokenusage parser. This is **not a pre-reservation**: concurrent requests can exceed remaining quota before settlement. Missing usage is not charged. Settlement failures after response cannot revoke already delivered tokens; requests fail closed when Redis is unavailable during admission. There is no durable settlement retry queue. Automatic downgrade after two low-use periods is not implemented; retain period ledgers and implement a separately reviewed scheduled policy. Ledger/registry/ticket storage has no automatic retention; operators must plan archival. Audit retention is bounded separately.
 
 ## Verification
 
-`ledger_test.go`: anchored boundaries, integer validation, reserved field/action rejection. `legacy_test.go`: copied upstream ai-quota regression suite, official source unchanged. `integration_test.py`: actual Redis EVAL against a disposable local Redis, unique prefix and cleanup, 22 cases covering dual dimensions, equal-tier selection, 3-billion usage, upgrade, refresh, ticket conflict, repeated settlement, rollover, late response, template scope and bounded enumeration.
+`ledger_test.go`: anchored boundaries, integer validation, reserved field/action rejection. `legacy_test.go`: copied upstream ai-quota regression suite, official source unchanged. `integration_test.py`: actual Redis EVAL against a disposable local Redis, unique prefix and cleanup, 22 cases covering dual dimensions, equal-tier selection, 3-billion usage, refresh, ticket conflict, repeated settlement, rollover, late response, template scope and bounded enumeration.
 
 ```sh
 docker run -d --rm --name walmart-quota-plugin-test -p 127.0.0.1:16389:6379 redis:7-alpine
@@ -72,7 +70,7 @@ Local verification logs are ignored: `tdd-failing.log`, `test-results.log`, `red
 
 Set `budget_policy: personal_department_money` with a dedicated `redis_key_prefix`
 (e.g. `wmt_portal_money:`). Do not reuse a token ledger prefix. Omitted policy
-preserves the legacy modes. Default example budgets are CNY 100/300/1000.
+preserves the legacy modes. Default budgets are CNY 500/1500.
 Amounts and prices use integer micro-yuan; one yuan is 1,000,000 micro-yuan.
 `prices` maps model names to `input_price_micros` / `output_price_micros`, per
 million tokens. Missing prices reject requests; explicit zero is free.
@@ -92,6 +90,20 @@ has no durable retry queue. The caller's department header is never consulted.
 GET/POST `prices` reads/replaces the complete map using the usual period/ticket
 contract. User mutation actions and department assignment retain audit and
 idempotency records. Do not expose the admin key to clients.
+
+Money mode `/meta` returns `period_days` and `next_period_days`. POST `/cycle`
+with `{ "days": 7, "period": "<meta.period>", "ticket_id": "<unique>" }`
+sets the next cycle to 7 days (1–365 whole days); it does not change the
+current ledger. POST `/reset` with the current `period` and a unique
+`ticket_id` immediately opens a new cycle. Optional `start_date` and
+`end_date` (both `YYYY-MM-DD`) select its inclusive calendar dates in
+Asia/Shanghai; the selected range must include today and span 1–365 days.
+Without dates, reset uses the pending length starting immediately. After a
+selected range ends, following cycles use the configured next-cycle length.
+Previous period ledgers remain available for late settlement and audit, while
+new requests start with fresh user balances. Both actions require the admin
+consumer and are recorded in audit. Cycle configuration is stored under the
+money namespace in Redis, so its persistence follows Redis persistence.
 
 A namespace policy marker prevents accidentally reusing an existing token ledger.
 Unmarked namespaces containing ledger/configuration keys are rejected; deploy

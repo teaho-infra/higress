@@ -13,7 +13,7 @@ import (
 var moneyScript string
 
 const moneyPolicy = "personal_department_money"
-const defaultMoneyTiers = `{"L1":{"quota":100000000,"models":[]},"L2":{"quota":300000000,"models":[]},"L3":{"quota":1000000000,"models":[]}}`
+const defaultMoneyTiers = `{"L1":{"quota":500000000,"models":[]},"L2":{"quota":1500000000,"models":[]}}`
 
 func moneyCost(input, output, inPrice, outPrice int64) (int64, error) {
 	for _, n := range []int64{input, output, inPrice, outPrice} {

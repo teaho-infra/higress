@@ -68,9 +68,6 @@ else
  local a=account(r.dimension,r.subject,r.app);before=cjson.decode(cjson.encode(a))
  if r.action=='assign' then
  baseJSON=cjson.encode({tier=r.tier,app=r.app or a.app});a.base_tier=r.tier;a.tier=r.tier;a.limit=a.limit+tiers[r.tier].quota-(a.base_quota or 0);a.base_quota=tiers[r.tier].quota;a.models=tiers[r.tier].models or {}
- elseif r.action=='tier' then
- if rank(r.tier)<rank(a.tier) then return fail('downgrade_forbidden','Temporary tier only allows upgrade',409) end
- local old=a.base_quota or 0;a.limit=a.limit+tiers[r.tier].quota-old;a.base_quota=tiers[r.tier].quota;a.tier=r.tier;a.models=tiers[r.tier].models or {}
  elseif r.action=='delta' then
  if math.abs(a.limit+r.value)>9999999999999 or a.limit+r.value<0 then return fail('invalid_amount','Resulting limit out of range',400) end;a.limit=a.limit+r.value
  elseif r.action~='refresh' then return fail('invalid_action','Unknown action',400) end

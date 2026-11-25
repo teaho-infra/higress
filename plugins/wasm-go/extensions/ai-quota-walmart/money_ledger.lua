@@ -1,8 +1,28 @@
 local p=KEYS[1]
 local r=cjson.decode(ARGV[1])
 local function fail(code,msg,status) return cjson.encode({ok=false,error='ai-quota-walmart.'..code,message=msg,status=status}) end
-if r.action~='settle' and r.action~='block' and r.period_start_unix then
- local now=tonumber(redis.call('TIME')[1]);if now<r.period_start_unix or now>=r.period_end_unix then return fail('period_conflict','Period changed; retry with current period',409) end
+local now=tonumber(redis.call('TIME')[1])
+local tk=r.ticket_id and p..'ticket:'..r.ticket_id or nil
+if tk and r.action~='settle' and r.action~='block' then
+ local prior=redis.call('GET',tk)
+ if prior then local old=cjson.decode(prior);if old.fingerprint~=r.fingerprint then return fail('ticket_conflict','Ticket already used with different request',409) end;return old.response end
+end
+local configured=redis.call('GET',p..'cycle_config')
+local cycle=configured and cjson.decode(configured) or nil
+local function activeCycle()
+ if not cycle then return string.sub(r.period_start,1,10),r.period_start_unix,r.period_end_unix,14,14 end
+ local boundary=cycle.end_unix or cycle.anchor+cycle.current_days*86400
+ if now<boundary then return cycle.current_period,cycle.anchor,boundary,cycle.current_days,cycle.next_days end
+ local days=cycle.next_days or cycle.current_days
+ local start=boundary+math.floor((now-boundary)/(days*86400))*days*86400
+ return 'c'..cycle.revision..':'..start,start,start+days*86400,days,days
+end
+local activePeriod,periodStart,periodEnd,periodDays,nextPeriodDays=activeCycle()
+if r.action~='settle' and r.action~='block' then
+ if r.ticket_id and r.period~=activePeriod then return fail('period_conflict','Current period required',409) end
+ r.period=activePeriod;r.period_start_unix=periodStart;r.period_end_unix=periodEnd
+ if cycle then r.period_start=periodStart;r.period_end=periodEnd end
+ if now<periodStart or now>=periodEnd then return fail('period_conflict','Period changed; retry with current period',409) end
 end
 if r.app~=nil and type(r.app)~='string' then return fail('invalid_request','app must be a string',400) end
 local marker=redis.call('GET',p..'budget_policy')
@@ -42,7 +62,7 @@ local function snapshot(a)
  if a.dimension=='user' then a.effective_dimension='user';a.effective_subject=a.subject;a.effective_tier=a.tier;a.effective_limit=a.limit;a.effective_balance=a.balance end
  return a
 end
-if r.action=='meta' then return cjson.encode({ok=true,period=r.period,period_start=r.period_start,period_end=r.period_end,tiers=tiers,tiers_scope='future_initialization',budget_policy='personal_department_money',currency='CNY',amount_unit='micro_yuan',prices=prices}) end
+if r.action=='meta' then return cjson.encode({ok=true,period=r.period,period_start=r.period_start,period_end=r.period_end,period_days=periodDays,next_period_days=nextPeriodDays,tiers=tiers,tiers_scope='future_initialization',budget_policy='personal_department_money',currency='CNY',amount_unit='micro_yuan',prices=prices}) end
 if r.action=='prices' and not r.prices then return cjson.encode({ok=true,prices=prices,period=r.period}) end
 if r.action=='accounts' then
  local list=redis.call('ZRANGE',p..'registry:'..r.dimension,r.offset,r.offset+r.limit-1);local out={}
@@ -81,9 +101,31 @@ if r.action=='settle' then
  return cjson.encode({ok=true})
 end
 if r.action=='query' or r.action=='usage' then local a=account(r.dimension,r.subject);a.ok=true;return cjson.encode(snapshot(a)) end
-local tk=p..'ticket:'..r.ticket_id
-local prior=redis.call('GET',tk)
-if prior then local old=cjson.decode(prior);if old.fingerprint~=r.fingerprint then return fail('ticket_conflict','Ticket already used with different request',409) end;return old.response end
+if r.action=='cycle' or r.action=='reset' then
+ if r.action=='cycle' and (type(r.days)~='number' or r.days~=math.floor(r.days) or r.days<1 or r.days>365) then return fail('invalid_cycle','days must be from 1 to 365',400) end
+ if r.action=='reset' and (r.start_unix~=nil or r.end_unix~=nil) then
+  if type(r.start_unix)~='number' or type(r.end_unix)~='number' or r.start_unix~=math.floor(r.start_unix) or r.end_unix~=math.floor(r.end_unix) or r.start_unix>now or r.end_unix<=now or r.end_unix-r.start_unix<86400 or r.end_unix-r.start_unix>365*86400 or (r.end_unix-r.start_unix)%86400~=0 then
+   return fail('invalid_cycle','Reset date range must include today and last 1 to 365 days',400)
+  end
+ end
+ local revision=(cycle and cycle.revision or 0)+1
+ local updated={anchor=periodStart,end_unix=periodEnd,current_days=periodDays,current_period=activePeriod,next_days=r.action=='cycle' and r.days or nextPeriodDays,revision=revision}
+ if r.action=='reset' then
+  updated.anchor=r.start_unix or now
+  updated.end_unix=r.end_unix or now+nextPeriodDays*86400
+  updated.current_days=r.end_unix and (r.end_unix-r.start_unix)/86400 or nextPeriodDays
+  updated.next_days=nextPeriodDays;updated.current_period='r'..revision..':'..updated.anchor
+ end
+ local before={period=activePeriod,period_days=periodDays,next_period_days=nextPeriodDays,period_start=periodStart,period_end=periodEnd}
+ local after={period=updated.current_period,period_days=updated.current_days,next_period_days=updated.next_days,period_start=updated.anchor,period_end=updated.end_unix}
+ local record={ticket_id=r.ticket_id,action=r.action,operator=r.operator,period=activePeriod,occurred_at=r.occurred_at,before=before,after=after}
+ local result=cjson.encode({ok=true,period=after.period,cycle=after})
+ mark()
+ redis.call('SET',p..'cycle_config',cjson.encode(updated))
+ redis.call('LPUSH',p..'audit',cjson.encode(record));redis.call('LTRIM',p..'audit',0,9999)
+ redis.call('SET',tk,cjson.encode({fingerprint=r.fingerprint,response=result}))
+ return result
+end
 local before={};local after={};local pending=nil;local baseJSON=nil;local tiersJSON=nil;local pricesJSON=nil
 if r.action=='prices' then
  before=prices;after=r.prices;pricesJSON=cjson.encode(r.prices)
@@ -99,9 +141,6 @@ else
  local b={tier=r.tier,department=r.department or a.department,app=r.app or a.app}
  local t,source=resolved(b);if t=='' then return fail('invalid_department','Valid department required for inheritance',400) end
  baseJSON=cjson.encode(b);a.department=b.department;a.quota_source=source;a.base_tier=r.tier;a.tier=t;a.limit=a.limit+tiers[t].quota-(a.base_quota or 0);a.base_quota=tiers[t].quota;a.models=tiers[t].models or {}
- elseif r.action=='tier' then
- if rank(r.tier)<rank(a.tier) then return fail('downgrade_forbidden','Temporary tier only allows upgrade',409) end
- local old=a.base_quota or 0;a.limit=a.limit+tiers[r.tier].quota-old;a.base_quota=tiers[r.tier].quota;a.tier=r.tier;a.models=tiers[r.tier].models or {}
  elseif r.action=='delta' then
  if math.abs(a.limit+r.value)>9999999999999 or a.limit+r.value<0 then return fail('invalid_amount','Resulting limit out of range',400) end;a.limit=a.limit+r.value
  elseif r.action~='refresh' then return fail('invalid_action','Unknown action',400) end
